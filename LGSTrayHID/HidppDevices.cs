@@ -20,8 +20,9 @@ namespace LGSTrayHID
 
         private bool _isReading = true;
         private const int READ_TIMEOUT = 100;
+        private const int LOCK_TIMEOUT = 1000;
 
-        private readonly Dictionary<ushort, HidppDevice> _deviceCollection = [];
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<ushort, HidppDevice> _deviceCollection = [];
         public IReadOnlyDictionary<ushort, HidppDevice> DeviceCollection => _deviceCollection;
 
         private readonly SemaphoreSlim _semaphore = new(1, 1);
@@ -108,7 +109,17 @@ namespace LGSTrayHID
                     continue;
                 }
 
-                await ProcessMessgage(buffer);
+                // Hand off a copy: `buffer` is reused by the next read, which would
+                // otherwise overwrite a reply before the waiting request inspects it.
+                byte[] msg = buffer.AsSpan(0, ret).ToArray();
+                try
+                {
+                    await ProcessMessgage(msg);
+                }
+                catch (Exception)
+                {
+                    // A single malformed report must not kill the read loop
+                }
             }
 
             HidClose(dev);
@@ -116,22 +127,27 @@ namespace LGSTrayHID
 
         private async Task ProcessMessgage(byte[] buffer)
         {
-            if ((buffer[2] == 0x41) && ((buffer[4] & 0x40) == 0))
+            if ((buffer.Length >= 5) && (buffer[2] == 0x41) && ((buffer[4] & 0x40) == 0))
             {
+                // Device (re)connected to the receiver; re-initialise that slot.
                 byte deviceIdx = buffer[1];
-                if (true || !_deviceCollection.ContainsKey(deviceIdx))
+                HidppDevice device = new(this, deviceIdx);
+                if (_deviceCollection.TryGetValue(deviceIdx, out var previous))
                 {
-                    _deviceCollection[deviceIdx] = new(this, deviceIdx);
-                    new Thread(async () =>
-                    {
-                        try
-                        {
-                            await Task.Delay(1000);
-                            await _deviceCollection[deviceIdx].InitAsync();
-                        }
-                        catch (Exception) { }
-                    }).Start();
+                    // Stop the superseded instance so poll loops don't pile up
+                    previous.Cancel();
                 }
+                _deviceCollection[deviceIdx] = device;
+
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await Task.Delay(1000);
+                        await device.InitWithRetryAsync();
+                    }
+                    catch (Exception) { }
+                });
             }
             else
             {
@@ -143,7 +159,9 @@ namespace LGSTrayHID
         {
             ObjectDisposedException.ThrowIf(_disposeCount > 0, this);
 
-            bool locked = await _semaphore.WaitAsync(100);
+            if (hidDevicePtr == IntPtr.Zero) { return []; }
+
+            bool locked = await _semaphore.WaitAsync(LOCK_TIMEOUT);
             if (!locked)
             {
                 return [];
@@ -163,7 +181,7 @@ namespace LGSTrayHID
                     {
                         ret = await _channel.Reader.ReadAsync(cts.Token);
 
-                        if ((ret[2] == 0x8F) || (ret[2] == buffer[2]))
+                        if ((ret.Length >= 3) && ((ret[2] == 0x8F) || (ret[2] == buffer[2])))
                         {
                             return ret;
                         }
@@ -179,11 +197,13 @@ namespace LGSTrayHID
             }
         }
 
-        public async Task<Hidpp20> WriteRead20(HidDevicePtr hidDevicePtr, Hidpp20 buffer, int timeout = 100, bool ignoreHID10 = true)
+        public async Task<Hidpp20> WriteRead20(HidDevicePtr hidDevicePtr, Hidpp20 buffer, int timeout = 500, bool ignoreHID10 = true)
         {
             ObjectDisposedException.ThrowIf(_disposeCount > 0, this);
 
-            bool locked = await _semaphore.WaitAsync(100);
+            if (hidDevicePtr == IntPtr.Zero) { return (Hidpp20)Array.Empty<byte>(); }
+
+            bool locked = await _semaphore.WaitAsync(LOCK_TIMEOUT);
             if (!locked)
             {
                 return (Hidpp20)Array.Empty<byte>();
@@ -202,6 +222,7 @@ namespace LGSTrayHID
                     try
                     {
                         ret = await _channel.Reader.ReadAsync(cts.Token);
+                        if (ret.Length < 4) { continue; }
 
                         if (!ignoreHID10 && (ret.GetFeatureIndex() == 0x8F))
                         {
@@ -232,7 +253,7 @@ namespace LGSTrayHID
             byte pingPayload = ++PING_PAYLOAD;
             Hidpp20 buffer = new byte[7] { 0x10, deviceId, 0x00, 0x10 | SW_ID, 0x00, 0x00, pingPayload };
             Hidpp20 ret = await WriteRead20(_devShort, buffer, timeout, ignoreHIDPP10);
-            if (ret.Length == 0)
+            if (ret.Length < 7)
             {
                 return false;
             }
@@ -311,7 +332,7 @@ namespace LGSTrayHID
             // Read number of devices on reciever
             ret = await WriteRead10(_devShort, [0x10, 0xFF, 0x81, 0x02, 0x00, 0x00, 0x00], 1000);
             byte numDeviceFound = 0;
-            if ((ret[2] == 0x81) && (ret[3] == 0x02))
+            if ((ret.Length >= 6) && (ret[2] == 0x81) && (ret[3] == 0x02))
             {
                 numDeviceFound = ret[5];
             }
@@ -329,7 +350,7 @@ namespace LGSTrayHID
                 // Fail to enumerate devices
                 for (byte i = 1; i <= 6; i++)
                 {
-                    var ping = await Ping20(i, 100, false);
+                    var ping = await Ping20(i, 500, false);
                     if (ping)
                     {
                         var deviceIdx = i;
@@ -337,9 +358,13 @@ namespace LGSTrayHID
                     }
                 }
 
-                foreach ((_, var device) in _deviceCollection)
+                foreach (var device in _deviceCollection.Values.ToArray())
                 {
-                    await device.InitAsync();
+                    try
+                    {
+                        await device.InitWithRetryAsync();
+                    }
+                    catch (Exception) { }
                 }
             }
         }

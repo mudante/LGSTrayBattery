@@ -37,6 +37,16 @@ namespace LGSTrayHID.HidApi
             return _HidOpenPath(dev.Path);
         }
 
+        internal static unsafe nint HidOpenPath(string path)
+        {
+            // hidapi expects a NUL-terminated narrow string
+            byte[] bytes = System.Text.Encoding.UTF8.GetBytes(path + '\0');
+            fixed (byte* p = bytes)
+            {
+                return _HidOpenPath(p);
+            }
+        }
+
         [LibraryImport("hidapi", EntryPoint = "hid_close")]
         internal static unsafe partial void HidClose(nint dev);
 

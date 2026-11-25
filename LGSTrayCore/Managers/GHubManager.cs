@@ -96,7 +96,15 @@ namespace LGSTrayCore.Managers
 
             _ws = new WebsocketClient(url, factory);
             _ws.MessageReceived.Subscribe(ParseSocketMsg);
-            _ws.ErrorReconnectTimeout = TimeSpan.FromMilliseconds(500);
+            // Fires on the initial connection and on every reconnect (e.g. G HUB was
+            // not running yet at login, or it restarted/updated itself). Messages sent
+            // while disconnected are dropped, so (re)subscribe each time we connect.
+            _ws.ReconnectionHappened.Subscribe(info =>
+            {
+                Debug.WriteLine($"Connected to LGHUB_agent ({info.Type})");
+                SubscribeAndLoad();
+            });
+            _ws.ErrorReconnectTimeout = TimeSpan.FromSeconds(5);
             _ws.ReconnectTimeout = null;
 
             Debug.WriteLine($"Trying to connect to LGHUB_agent, at {url}");
@@ -111,17 +119,18 @@ namespace LGSTrayCore.Managers
                 this.Dispose();
                 return;
             }
+        }
 
-            Debug.WriteLine($"Connected to LGHUB_agent");
-
-            _ws.Send(JsonConvert.SerializeObject(new
+        private void SubscribeAndLoad()
+        {
+            _ws?.Send(JsonConvert.SerializeObject(new
             {
                 msgId = "",
                 verb = "SUBSCRIBE",
                 path = "/devices/state/changed"
             }));
 
-            _ws.Send(JsonConvert.SerializeObject(new
+            _ws?.Send(JsonConvert.SerializeObject(new
             {
                 msgId = "",
                 verb = "SUBSCRIBE",
@@ -150,23 +159,40 @@ namespace LGSTrayCore.Managers
 
         protected void ParseSocketMsg(ResponseMessage msg)
         {
-            GHUBMsg ghubmsg = GHUBMsg.DeserializeJson(msg.Text!);
-
-            switch (ghubmsg.Path)
+            // An exception escaping this handler would tear down the Rx subscription
+            // and silently stop all further G HUB updates.
+            try
             {
-                case "/devices/list":
-                    {
-                        LoadDevices(ghubmsg.Payload);
-                        break;
-                    }
-                case "/battery/state/changed":
-                case { } when BatteryDeviceStateRegex().Match(ghubmsg.Path).Success:
-                    {
-                        Console.WriteLine(ghubmsg.Path);
-                        ParseBatteryUpdate(ghubmsg.Payload);
-                        break;
-                    }
-                default: break;
+                if (string.IsNullOrEmpty(msg.Text)) { return; }
+
+                GHUBMsg ghubmsg = GHUBMsg.DeserializeJson(msg.Text);
+                if (ghubmsg.Path == null || ghubmsg.Payload == null) { return; }
+
+                switch (ghubmsg.Path)
+                {
+                    case "/devices/state/changed":
+                        {
+                            // A device was connected/disconnected, refresh the list
+                            LoadDevices();
+                            break;
+                        }
+                    case "/devices/list":
+                        {
+                            LoadDevices(ghubmsg.Payload);
+                            break;
+                        }
+                    case "/battery/state/changed":
+                    case { } when BatteryDeviceStateRegex().Match(ghubmsg.Path).Success:
+                        {
+                            ParseBatteryUpdate(ghubmsg.Payload);
+                            break;
+                        }
+                    default: break;
+                }
+            }
+            catch (Exception e)
+            {
+                Debug.WriteLine($"Failed to handle LGHUB_agent message: {e.Message}");
             }
         }
 

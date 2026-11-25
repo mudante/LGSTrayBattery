@@ -17,7 +17,7 @@ namespace LGSTrayUI
         private readonly ISubscriber<IPCMessage> _subscriber;
 
         public ObservableCollection<LogiDeviceViewModel> Devices { get; } = [];
-        public IEnumerable<LogiDevice> GetDevices() => Devices;
+        public IEnumerable<LogiDevice> GetDevices() => Devices.ToArray();
 
         public LogiDeviceCollection(
             UserSettingsWrapper userSettings,
@@ -66,24 +66,29 @@ namespace LGSTrayUI
 
         public bool TryGetDevice(string deviceId, [NotNullWhen(true)] out LogiDevice? device)
         {
-            device = Devices.SingleOrDefault(x => x.DeviceId == deviceId);
+            device = Devices.ToArray().FirstOrDefault(x => x.DeviceId == deviceId);
 
             return device != null;
         }
 
         public void OnInitMessage(InitMessage initMessage)
         {
-            LogiDeviceViewModel? dev = Devices.SingleOrDefault(x => x.DeviceId == initMessage.deviceId);
-            if (dev != null)
+            // Look up and add on the UI thread in one step. Doing the lookup on the
+            // calling thread raced with the deferred Add, so two quick INIT messages
+            // for the same device (reconnects, G HUB resubscribes) created duplicate
+            // entries, after which SingleOrDefault threw on every later message.
+            Application.Current.Dispatcher.BeginInvoke(() =>
             {
-                Application.Current.Dispatcher.BeginInvoke(() => dev.UpdateState(initMessage));
+                LogiDeviceViewModel? dev = Devices.FirstOrDefault(x => x.DeviceId == initMessage.deviceId);
+                if (dev != null)
+                {
+                    dev.UpdateState(initMessage);
+                    return;
+                }
 
-                return;
-            }
-
-            dev = _logiDeviceViewModelFactory.CreateViewModel((x) => x.UpdateState(initMessage));
-
-            Application.Current.Dispatcher.BeginInvoke(() => Devices.Add(dev));
+                dev = _logiDeviceViewModelFactory.CreateViewModel((x) => x.UpdateState(initMessage));
+                Devices.Add(dev);
+            });
         }
 
         public void OnUpdateMessage(UpdateMessage updateMessage)
